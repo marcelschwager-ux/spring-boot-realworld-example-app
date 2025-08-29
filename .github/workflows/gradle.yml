@@ -30,5 +30,7 @@ jobs:
         key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle*') }}
         restore-keys: |
           ${{ runner.os }}-gradle-
-    - name: Test with Gradle
-      run: ./gradlew clean test
+    - name: Test with Coverage
+      run: ./gradlew clean test jacocoTestReport
+    - name: Upload coverage to Codecov
+      uses: codecov/codecov-action@v2
