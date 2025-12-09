@@ -13,6 +13,11 @@ targetCompatibility = '11'
 // Override Tomcat version to fix CVE-2025-24813 (CRITICAL: Potential RCE vulnerability)
 ext['tomcat.version'] = '9.0.99'
 
+// Add JVM args for Java 17+ compatibility with Tomcat 9.0.99
+tasks.named('bootRun') {
+    jvmArgs '--add-opens=java.base/java.io=ALL-UNNAMED'
+}
+
 spotless {
     java {
         target project.fileTree(project.rootDir) {
