@@ -1,0 +1,145 @@
+name: Trivy Vulnerability Scan with Devin Auto-Fix
+
+on:
+  push:
+    branches:
+      - master
+      - main
+
+jobs:
+  trivy-scan:
+    name: Trivy Vulnerability Scan
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          format: 'json'
+          output: 'trivy-results.json'
+          severity: 'CRITICAL,HIGH,MEDIUM'
+          scanners: 'vuln'
+
+      - name: Check for vulnerabilities and trigger Devin
+        env:
+          DEVIN_API_TOKEN: ${{ secrets.DEVIN_API_TOKEN }}
+        run: |
+          # Check if trivy results file exists and has content
+          if [ ! -f trivy-results.json ]; then
+            echo "No Trivy results file found"
+            exit 0
+          fi
+
+          # Parse vulnerabilities from Trivy output
+          VULN_COUNT=$(jq '[.Results[]?.Vulnerabilities // [] | length] | add // 0' trivy-results.json)
+          echo "Found $VULN_COUNT vulnerabilities"
+
+          if [ "$VULN_COUNT" -eq 0 ]; then
+            echo "No vulnerabilities found. Skipping Devin session."
+            exit 0
+          fi
+
+          # Extract vulnerability summary for the prompt
+          VULN_SUMMARY=$(jq -r '
+            [.Results[] | select(.Vulnerabilities != null) | .Vulnerabilities[] | 
+              {
+                id: .VulnerabilityID,
+                pkg: .PkgName,
+                severity: .Severity,
+                installed: .InstalledVersion,
+                fixed: .FixedVersion,
+                title: .Title
+              }
+            ] | 
+            group_by(.severity) | 
+            map({
+              severity: .[0].severity,
+              count: length,
+              packages: [.[] | "\(.pkg)@\(.installed) -> \(.fixed // "no fix available") (\(.id))"] | unique | join(", ")
+            }) |
+            map("\(.severity): \(.count) vulnerabilities in packages: \(.packages)") |
+            join("\n")
+          ' trivy-results.json)
+
+          echo "Vulnerability Summary:"
+          echo "$VULN_SUMMARY"
+
+          # Check if DEVIN_API_TOKEN is set
+          if [ -z "$DEVIN_API_TOKEN" ]; then
+            echo "Error: DEVIN_API_TOKEN secret is not set"
+            echo "Please add your Devin API token to repository secrets"
+            exit 1
+          fi
+
+          # Create the prompt for Devin
+          PROMPT="You are tasked with fixing security vulnerabilities detected by Trivy in the repository ${{ github.repository }}.
+
+          ## Vulnerability Scan Results
+          Total vulnerabilities found: $VULN_COUNT
+
+          $VULN_SUMMARY
+
+          ## Your Tasks
+          1. Clone the repository ${{ github.repository }} and checkout the latest code from the ${{ github.ref_name }} branch.
+          2. Review the build.gradle file to understand the current dependency versions.
+          3. Update the vulnerable dependencies to their fixed versions where available.
+          4. For Spring Boot vulnerabilities, consider updating the Spring Boot version in build.gradle.
+          5. Run './gradlew build' to ensure the project still compiles after updates.
+          6. Run './gradlew test' to ensure tests still pass.
+          7. Create a pull request with the dependency updates, including:
+             - A clear title mentioning security vulnerability fixes
+             - A description listing all updated dependencies and their CVEs
+             - Reference this automated scan in the PR description
+
+          ## Guidelines
+          - Only update dependencies that have known fixes available
+          - Prefer minor/patch version updates over major version updates when possible
+          - If a major version update is required, note any breaking changes
+          - Do not modify application code unless absolutely necessary for compatibility
+          - Ensure backward compatibility with existing functionality
+
+          ## Repository Information
+          - Repository: ${{ github.repository }}
+          - Branch: ${{ github.ref_name }}
+          - Commit: ${{ github.sha }}
+          - Triggered by: Trivy vulnerability scan in GitHub Actions"
+
+          # Escape the prompt for JSON
+          ESCAPED_PROMPT=$(echo "$PROMPT" | jq -Rs .)
+
+          echo "Triggering Devin session to fix vulnerabilities..."
+
+          # Call Devin API to create a session
+          RESPONSE=$(curl -s -X POST \
+            -H "Authorization: Bearer $DEVIN_API_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "{\"prompt\": $ESCAPED_PROMPT, \"idempotent\": true}" \
+            "https://api.devin.ai/v1/sessions")
+
+          echo "Devin API Response:"
+          echo "$RESPONSE" | jq .
+
+          # Check if session was created successfully
+          SESSION_ID=$(echo "$RESPONSE" | jq -r '.session_id // empty')
+          if [ -n "$SESSION_ID" ]; then
+            echo "Devin session created successfully!"
+            echo "Session ID: $SESSION_ID"
+            echo "View session at: https://app.devin.ai/sessions/$SESSION_ID"
+          else
+            ERROR=$(echo "$RESPONSE" | jq -r '.error // .message // "Unknown error"')
+            echo "Failed to create Devin session: $ERROR"
+            exit 1
+          fi
+
+      - name: Upload Trivy scan results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: trivy-results
+          path: trivy-results.json
+          retention-days: 30
